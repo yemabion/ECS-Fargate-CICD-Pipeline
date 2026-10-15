@@ -1,0 +1,13 @@
+{
+  "name": "hello-cicd",
+  "version": "1.0.0",
+  "description": "Minimal web service deployed through GitHub Actions to AWS ECS Fargate",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "src/server.js",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,18 @@
+node_modules/
+.env
+.env.*
+*.log
+.DS_Store
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+tfplan
+infra/terraform.tfvars
+infra/backend.hcl
+infra/bootstrap/terraform.tfvars
+# keep the lock file so provider versions are reproducible
+!.terraform.lock.hcl

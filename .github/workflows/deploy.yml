@@ -1,0 +1,130 @@
+name: Build & Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+# Never run two deployments at once; queue instead of cancelling mid-deploy.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # OIDC token for AWS (no long-lived keys)
+  contents: read
+
+jobs:
+  ci:
+    name: Quality gate
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Build, push & deploy
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+      CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      # 1. Checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify required configuration
+        run: |
+          : "${AWS_REGION:?Set repo variable AWS_REGION}"
+          : "${ECR_REPOSITORY:?Set repo variable ECR_REPOSITORY}"
+          : "${ECS_CLUSTER:?Set repo variable ECS_CLUSTER}"
+          : "${ECS_SERVICE:?Set repo variable ECS_SERVICE}"
+          : "${ECS_TASK_FAMILY:?Set repo variable ECS_TASK_FAMILY}"
+          : "${CONTAINER_NAME:?Set repo variable CONTAINER_NAME}"
+
+      # 3. Authenticate to AWS via OIDC
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 2. Build the image from the repo's Dockerfile
+      - name: Build Docker image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          docker build --pull \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+
+      # 4. Push (immutable tag = commit SHA, so every deploy is traceable)
+      - name: Push image to ECR
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      # 5. Deploy: new task-definition revision -> aws ecs update-service
+      - name: Deploy to ECS
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_FAMILY" \
+            --query taskDefinition > taskdef.json
+
+          jq --arg IMAGE "$IMAGE" --arg NAME "$CONTAINER_NAME" '
+            .containerDefinitions |= map(if .name == $NAME then .image = $IMAGE else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)
+          ' taskdef.json > new-taskdef.json
+
+          NEW_TD_ARN="$(aws ecs register-task-definition \
+            --cli-input-json file://new-taskdef.json \
+            --query taskDefinition.taskDefinitionArn --output text)"
+          echo "Registered: $NEW_TD_ARN"
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TD_ARN" > /dev/null
+
+          echo "Waiting for service to stabilise..."
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+          # 'stable' is also true after an automatic rollback, so verify the
+          # NEW deployment actually completed.
+          STATE="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query "services[0].deployments[?taskDefinition=='$NEW_TD_ARN'].rolloutState | [0]" \
+            --output text)"
+          echo "Rollout state: $STATE"
+          [ "$STATE" = "COMPLETED" ] || { echo "::error::Deployment did not complete (state: $STATE)"; exit 1; }
+
+          {
+            echo "### Deployed :rocket:"
+            echo "- Image: \`$IMAGE\`"
+            echo "- Task definition: \`$NEW_TD_ARN\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show recent service events on failure
+        if: failure()
+        run: |
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].events[:10].[createdAt,message]' --output text || true

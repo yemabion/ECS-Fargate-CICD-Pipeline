@@ -1,0 +1,10 @@
+.git
+.github
+infra
+scripts
+docs
+**/node_modules
+**/test
+*.md
+.env*
+Makefile

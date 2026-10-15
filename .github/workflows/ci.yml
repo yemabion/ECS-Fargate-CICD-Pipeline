@@ -1,0 +1,70 @@
+name: CI
+
+# Runs on every pull request, and is reused by deploy.yml as a quality gate
+# before anything is pushed to ECR or ECS.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Run tests
+        working-directory: app
+        run: npm test
+
+  docker:
+    name: Docker build & smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t hello-cicd:ci .
+      - name: Run container and verify response
+        run: |
+          docker run -d --name smoke -p 3000:3000 hello-cicd:ci
+          for i in $(seq 1 20); do
+            curl -fsS http://localhost:3000/health && break
+            sleep 1
+          done
+          BODY="$(curl -fsS http://localhost:3000/)"
+          echo "Response: $BODY"
+          test "$BODY" = "Hello from CI/CD Pipeline!"
+      - name: Container logs
+        if: always()
+        run: docker logs smoke || true
+
+  terraform:
+    name: Terraform fmt & validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+      - name: Format check
+        run: terraform fmt -check -recursive -diff
+        working-directory: infra
+      - name: Validate infra
+        working-directory: infra
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+      - name: Validate bootstrap
+        working-directory: infra/bootstrap
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate

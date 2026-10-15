@@ -1,0 +1,5 @@
+bucket       = "YOUR-UNIQUE-STATE-BUCKET"   # created by infra/bootstrap
+key          = "cicd-demo/prod/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
