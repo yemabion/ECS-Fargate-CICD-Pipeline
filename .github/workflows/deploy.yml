@@ -48,7 +48,10 @@ jobs:
           : "${ECS_SERVICE:?Set repo variable ECS_SERVICE}"
           : "${ECS_TASK_FAMILY:?Set repo variable ECS_TASK_FAMILY}"
           : "${CONTAINER_NAME:?Set repo variable CONTAINER_NAME}"
-
+                - name: Debug OIDC subject (temporary)
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)
+          echo "$TOKEN" | python3 -c "import sys,base64,json; p=sys.stdin.read().strip().split('.')[1]; p+='='*(-len(p)%4); d=json.loads(base64.urlsafe_b64decode(p)); print({k:d.get(k) for k in ['sub','aud','repository','environment']})"
       # 3. Authenticate to AWS via OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
