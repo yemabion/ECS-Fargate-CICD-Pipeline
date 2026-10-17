@@ -132,3 +132,15 @@ variable "alb_deletion_protection" {
   type        = bool
   default     = false
 }
+
+variable "github_owner_id" {
+  description = "Numeric GitHub owner ID (appears in the OIDC subject for newer repos)."
+  type        = string
+  default     = ""
+}
+
+variable "github_repo_id" {
+  description = "Numeric GitHub repository ID (appears in the OIDC subject for newer repos)."
+  type        = string
+  default     = ""
+}

@@ -15,6 +15,13 @@ data "aws_iam_openid_connect_provider" "github" {
 
 locals {
   github_oidc_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
+
+  github_sub_values = concat(
+    ["repo:${var.github_repository}:environment:${var.github_environment}"],
+    var.github_owner_id != "" && var.github_repo_id != "" ? [
+      "repo:${split("/", var.github_repository)[0]}@${var.github_owner_id}/${split("/", var.github_repository)[1]}@${var.github_repo_id}:environment:${var.github_environment}"
+    ] : []
+  )
 }
 
 data "aws_iam_policy_document" "github_trust" {
@@ -33,10 +40,11 @@ data "aws_iam_policy_document" "github_trust" {
     }
 
     # Only the deploy job of THIS repo, running in the protected environment.
+    # Newer repos include numeric owner/repo IDs in the subject, so both forms are accepted.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repository}:environment:${var.github_environment}"]
+      values   = local.github_sub_values
     }
   }
 }
