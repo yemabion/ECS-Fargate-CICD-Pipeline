@@ -1,172 +1,185 @@
-# CI/CD Pipeline: GitHub Actions → Docker → Amazon ECR → ECS Fargate (Terraform)
+# Enterprise-Grade CI/CD on AWS ECS Fargate
 
-A small Node.js service (`Hello from CI/CD Pipeline!`) delivered through a production-style
-pipeline. Every push to `main` is tested, built into a Docker image, pushed to ECR and
-rolled out to ECS Fargate behind an Application Load Balancer, with automatic rollback.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC)
+![GitHub Actions](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF)
+![AWS](https://img.shields.io/badge/AWS-ECS%20Fargate-FF9900)
+
+A small Node.js service delivered through a production-style pipeline:
+**GitHub Actions → Docker → Amazon ECR → ECS Fargate behind an Application Load Balancer**, with all infrastructure in **Terraform**.
+Every push to `main` is tested, containerised, pushed to ECR and rolled out to ECS with a verified, auto-rolling-back deployment, using **no long-lived AWS credentials**.
+
+> **Status:** the AWS environment was torn down after testing to avoid costs. The evidence is in the screenshots below and in the
+> [full project PDF](docs/ECS-Fargate-CICD-Project-Evidence.pdf). The Terraform recreates everything in about 10 minutes (see [Deploy it yourself](#deploy-it-yourself)).
+
+![Final pipeline run](docs/images/01-pipeline-success.png)
+
+## Highlights
+
+| Area | What it does |
+|---|---|
+| **Keyless auth** | GitHub OIDC gives short-lived AWS credentials. The IAM role trusts only this repository and the `production` environment, with a least-privilege deploy policy. |
+| **Traceable releases** | ECR tags are immutable and equal the commit SHA, so any running container maps back to the commit that built it. Scan-on-push and a lifecycle policy are enabled. |
+| **Verified deployments** | The pipeline registers a new task-definition revision, runs `aws ecs update-service`, then polls until the new deployment is `COMPLETED`. The ECS circuit breaker rolls back automatically if tasks fail to become healthy. |
+| **Quality gate** | Unit tests, a container smoke test and `terraform fmt`/`validate` must pass before anything is pushed or deployed. |
+| **Resilience** | Two Availability Zones, at least two tasks, rolling deploys at 100% minimum healthy, and CPU target-tracking autoscaling. |
+| **Security** | Non-root container with read-only root filesystem, tasks reachable only from the ALB security group, locked default security group, VPC flow logs, encrypted and versioned remote state. |
+| **Observability** | Structured JSON logs in CloudWatch, Container Insights, and alarms for unhealthy targets and 5xx errors. |
+
+## Architecture
+
+![Architecture](docs/images/architecture.png)
+
+1. A developer pushes to `main`.
+2. GitHub triggers the workflow.
+3. The deploy job requests an OIDC token and assumes a short-lived AWS role.
+4. The image is pushed to ECR, tagged with the commit SHA.
+5. A new task-definition revision is registered and the ECS service is updated.
+6. Fargate pulls the image from ECR.
+7. Users reach the application through the load balancer.
+8. The ALB forwards to healthy tasks on port 3000.
+
+### Deployment pipeline
 
 ```mermaid
 flowchart LR
-  Dev[Developer] -->|git push main| GH[GitHub]
-  GH --> CI["CI: tests, docker smoke test, terraform validate"]
-  CI --> CD["Deploy job (OIDC, no stored keys)"]
-  CD -->|docker push :sha| ECR[(Amazon ECR)]
-  CD -->|register task def + update-service| ECS
-  subgraph VPC["VPC (2 AZs)"]
-    ALB[Application Load Balancer] --> ECS["ECS Fargate service (2+ tasks)"]
-  end
-  ECR -.pull.-> ECS
-  User((User)) --> ALB
+  A[Push to main] --> B["Quality gate<br/>tests, smoke test, terraform validate"]
+  B --> C["OIDC login<br/>assume AWS role"]
+  C --> D[Build image]
+  D --> E["Push to ECR<br/>tag = commit SHA"]
+  E --> F["Register new<br/>task definition"]
+  F --> G[aws ecs update-service]
+  G --> H{"Rollout<br/>COMPLETED?"}
+  H -- yes --> I[Release verified]
+  H -- no --> J["Circuit breaker<br/>auto-rollback"]
 ```
+
+## Evidence
+
+| | |
+|---|---|
+| ![Targets healthy](docs/images/02-alb-targets-healthy.png) **Load balancer targets: 2 healthy** | ![Tasks running](docs/images/03-ecs-tasks-running.png) **ECS service: 2 tasks running** |
+| ![ECS deployment](docs/images/06-ecs-deployment.png) **Deployment succeeded, 0/3 failed tasks** | ![Task definition image](docs/images/08-task-definition-image.png) **Image tagged with the commit SHA** |
+| ![ECR images](docs/images/07-ecr-images.png) **ECR: bootstrap image plus pipeline-built SHA tags** | ![Terraform apply](docs/images/05-terraform-apply.png) **`terraform apply`: 37 resources created** |
+
+The complete walkthrough, with 33 captioned figures, is in
+[`docs/ECS-Fargate-CICD-Project-Evidence.pdf`](docs/ECS-Fargate-CICD-Project-Evidence.pdf).
+
+## Problems met and solved
+
+**1. AWS rejected the GitHub OIDC login** (`Not authorized to perform sts:AssumeRoleWithWebIdentity`).
+A temporary debug step decoded the token claims and showed the `sub` claim now carries numeric owner and repository IDs for newer repositories, which my trust policy did not expect.
+The trust policy now accepts both formats (`github_owner_id` / `github_repo_id`).
+
+![OIDC debug output](docs/images/09-oidc-debug.png)
+
+**2. ECR refused to overwrite a released image.** Re-running a deployed commit fails with `tag invalid ... immutable`.
+This is deliberate: a released tag can never be silently replaced. Release again with a new commit, or roll back by pointing the service at an earlier task definition.
+
+![Immutable tag](docs/images/10-immutable-tag.png)
+
+**3. The deploy check raced ECS's own state change.** `aws ecs wait services-stable` returned while the rollout was still `IN_PROGRESS`, and a single check failed a healthy deployment.
+The pipeline now polls every 10 seconds until the rollout is `COMPLETED`, failing fast on `FAILED`.
+
+![Rollout race](docs/images/11-rollout-race.png)
 
 ## Repository layout
 
 ```
 .
-├── app/                    # Node.js service (zero dependencies) + tests
-├── Dockerfile              # multi-arch-safe, non-root, healthcheck
-├── infra/                  # Terraform (VPC, ALB, ECR, ECS, IAM, OIDC, alarms)
+├── app/                    # Node.js service (no dependencies) and unit tests
+├── Dockerfile              # slim, non-root image with a health check
+├── infra/                  # Terraform: VPC, ALB, ECR, ECS, IAM, OIDC, alarms
 │   └── bootstrap/          # one-time S3 bucket for remote state
 ├── .github/workflows/
-│   ├── ci.yml              # PR checks + reusable quality gate
-│   └── deploy.yml          # main: build → ECR → ECS
-├── scripts/                # first-push + GitHub config helpers
+│   ├── ci.yml              # pull-request checks and reusable quality gate
+│   └── deploy.yml          # main: build, push to ECR, deploy to ECS
+├── scripts/                # first-push and GitHub-config helpers (bash)
+├── docs/                   # project PDF and README images
 └── Makefile
 ```
 
-## What "enterprise level" means here
+## Deploy it yourself
 
-| Area | Implementation |
-|---|---|
-| Auth | GitHub OIDC → short-lived AWS credentials; role trusted only for this repo + `production` environment; least-privilege deploy policy |
-| Supply chain | Immutable ECR tags (commit SHA), scan-on-push, lifecycle policy, Dependabot for actions/docker/npm/terraform |
-| Reliability | 2 AZs, ≥2 tasks, rolling deploy (100% min healthy), **circuit-breaker auto-rollback**, pipeline verifies rollout is `COMPLETED` (not just "stable"), CPU autoscaling |
-| Security | Non-root container, read-only root FS, tasks reachable only from the ALB SG, default SG locked, ALB drops invalid headers, VPC flow logs, encrypted+versioned state bucket |
-| Observability | JSON logs → CloudWatch, Container Insights, alarms for unhealthy targets and 5xx (SNS) |
-| Delivery | Concurrency lock (one deploy at a time), PR validation, tests gate deploys, Terraform fmt/validate in CI, remote state with locking |
+**Prerequisites:** an AWS account and CLI credentials (not root), Terraform 1.10 or newer, Docker, Node.js 22 or newer, Git.
+Expect roughly $2 per day while it runs (ALB plus two Fargate tasks), so set a billing alert first and destroy it when done.
 
-## Prerequisites
-
-AWS account + CLI configured with admin-level credentials (for the initial Terraform run),
-Terraform ≥ 1.10, Docker, Node.js ≥ 22, Git, and optionally the GitHub CLI (`gh`).
-
-## 1. Run locally
+### 1. Run locally
 
 ```bash
-cd app && npm test && npm start          # http://localhost:3000
-# or
+cd app && npm test && npm start        # http://localhost:3000
 docker build -t hello-cicd:local .
 docker run --rm -p 3000:3000 hello-cicd:local
-curl http://localhost:3000               # Hello from CI/CD Pipeline!
 ```
 
-## 2. Create the remote state bucket (once)
+### 2. Create the remote state bucket (once)
 
 ```bash
 cd infra/bootstrap
 terraform init
-terraform apply -var 'state_bucket_name=<globally-unique-name>'
+terraform apply -var "state_bucket_name=<globally-unique-name>"
 ```
 
-## 3. Provision the infrastructure
+### 3. Configure Terraform
 
 ```bash
 cd infra
-cp backend.hcl.example backend.hcl            # put your bucket name in
-cp terraform.tfvars.example terraform.tfvars  # set github_repository = "owner/repo"
-terraform init -backend-config=backend.hcl
+cp backend.hcl.example backend.hcl            # set your bucket name
+cp terraform.tfvars.example terraform.tfvars  # set github_repository, owner and repo IDs
+```
 
-# The ECS service needs an image to start, so create ECR first...
+Newer repositories include numeric IDs in their OIDC token, so also set `github_owner_id` and `github_repo_id`.
+Find them with the GitHub CLI: `gh api users/<owner> --jq .id` and `gh api repos/<owner>/<repo> --jq .id`.
+If your AWS account already has a GitHub OIDC provider, set `create_github_oidc_provider = false`.
+
+### 4. Provision
+
+The ECS service needs an image to start, so create ECR first and push a bootstrap image:
+
+```bash
+terraform init -backend-config=backend.hcl
 terraform apply -target=aws_ecr_repository.app
-../scripts/first-push.sh                       # pushes tag "bootstrap"
-# ...then everything else
+../scripts/first-push.sh                       # bash; PowerShell equivalent below
 terraform apply
 ```
 
-If your AWS account already has a GitHub OIDC provider, set `create_github_oidc_provider = false`.
+### 5. Connect GitHub
 
-## 4. Configure GitHub
-
-Either run `./scripts/set-github-config.sh` (requires `gh`), or add these **repository variables**
-(Settings → Secrets and variables → Actions → Variables) from `terraform output`:
-
-| Variable | Terraform output |
-|---|---|
-| `AWS_REGION` | `aws_region` |
-| `AWS_ROLE_ARN` | `github_actions_role_arn` |
-| `ECR_REPOSITORY` | `ecr_repository_name` |
-| `ECS_CLUSTER` | `ecs_cluster_name` |
-| `ECS_SERVICE` | `ecs_service_name` |
-| `ECS_TASK_FAMILY` | `ecs_task_family` |
-| `CONTAINER_NAME` | `container_name` |
-
-Recommended: Settings → Environments → `production` → restrict to branch `main` (and add
-required reviewers if you want manual approval). Enable branch protection on `main`
-requiring the **CI** checks.
-
-## 5. Deploy
+Add these **repository variables** (Settings → Secrets and variables → Actions → Variables) from `terraform output`:
+`AWS_REGION`, `AWS_ROLE_ARN` (`github_actions_role_arn`), `ECR_REPOSITORY`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_TASK_FAMILY`, `CONTAINER_NAME`.
+Or run `./scripts/set-github-config.sh` with the GitHub CLI. Re-enable the **Build & Deploy to ECS** workflow if it is disabled, then push to `main`.
 
 ```bash
-git push origin main
-```
-
-Watch **Actions → Build & Deploy to ECS**. When it finishes:
-
-```bash
-terraform -chdir=infra output app_url
 curl "$(terraform -chdir=infra output -raw app_url)"   # Hello from CI/CD Pipeline!
 ```
 
-### Pipeline steps (deploy.yml)
-
-1. Checkout → 2. CI gate (tests, container smoke test, Terraform validate)
-3. Assume AWS role via OIDC (`aws-actions/configure-aws-credentials`) → 4. ECR login
-5. `docker build` from the repo Dockerfile → 6. `docker push` tagged with the commit SHA
-7. Register a new task-definition revision with the new image → `aws ecs update-service`
-8. `aws ecs wait services-stable`, then assert the new deployment is `COMPLETED`.
-
-## 6. Screenshot checklist for the PDF
-
-| # | Screenshot | Where |
-|---|---|---|
-| 1 | App running locally | terminal + browser at `localhost:3000` |
-| 2 | Docker build success | `docker build` output |
-| 3 | Container running | `docker ps` + `curl localhost:3000` |
-| 4 | ECR repository with image | AWS Console → ECR → repo → Images |
-| 5 | ECS cluster with running task | ECS → Clusters → service → Tasks (RUNNING) |
-| 6 | Target group healthy | EC2 → Target Groups → Targets (healthy) |
-| 7 | Terraform apply output | terminal (`Apply complete!` + outputs) |
-| 8 | GitHub Actions success | Actions run page, all jobs green |
-| 9 | Deployed app via ALB DNS | browser at `http://<alb-dns>` (URL bar visible) |
-| 10 | Repo structure | GitHub repo main page |
-
-Tip: include timestamps/account ID in frame, and blur nothing except secrets.
-
-## Teardown
+### 6. Tear down
 
 ```bash
 terraform -chdir=infra destroy
 ```
-(`ecr_force_delete = true` by default so a non-empty repo can be removed. The state bucket has
-`prevent_destroy`; delete it manually if you want it gone.)
 
-## Cost note
+### Windows / PowerShell notes
 
-ALB (~$16-20/mo) + 2 Fargate tasks (~$18/mo) + logs. Destroy when you're done.
+- Quote Terraform arguments containing a dot: `terraform init "-backend-config=backend.hcl"` and `terraform apply "-target=aws_ecr_repository.app"`.
+- `docker login` through a pipe can fail in PowerShell with `400 Bad Request`. Use:
 
-## Hardening for a real production system
+```powershell
+$REPO = terraform output -raw ecr_repository_url
+$REGISTRY = $REPO.Split('/')[0]
+$PW = aws ecr get-login-password --region us-east-1
+docker login --username AWS --password $PW $REGISTRY
+docker build --platform linux/amd64 -t "${REPO}:bootstrap" ..
+docker push "${REPO}:bootstrap"
+```
 
-- Add a domain + ACM certificate: HTTPS listener on 443, redirect 80→443.
-- Private subnets for tasks + NAT or VPC endpoints (ECR, S3, Logs) and set `assign_public_ip = false`.
-- Set `alb_deletion_protection = true`, `ecr_force_delete = false`; add ALB access logs and AWS WAF.
-- Pin GitHub Actions and the base image by SHA/digest.
-- Separate AWS accounts per environment; run `terraform plan` on PRs via a read-only role.
+## Next steps for a real production system
 
-## Troubleshooting
+- HTTPS: domain, ACM certificate, HTTPS listener and an 80 to 443 redirect.
+- Private subnets with VPC endpoints (ECR, S3, Logs) and no public task IPs; AWS WAF and ALB access logs.
+- Skip the push when the tag already exists, and run smoke tests against new tasks before shifting traffic.
+- `terraform plan` on pull requests with a read-only role; pin Actions and the base image by digest; image signing.
 
-| Symptom | Fix |
-|---|---|
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | `github_repository` in tfvars must match `owner/repo` exactly; deploy job must use environment `production` |
-| Tasks stuck `PENDING` / `CannotPullContainerError` | Image tag `bootstrap` missing in ECR, or image built for ARM. Re-run `scripts/first-push.sh` |
-| Target group unhealthy | Check CloudWatch log group `/ecs/cicd-demo-prod`; health path is `/health` on port 3000 |
-| Pipeline red with "Deployment did not complete" | Circuit breaker rolled back; see service events and task logs |
-| OIDC provider already exists | `create_github_oidc_provider = false` |
+## License
+
+[MIT](LICENSE)

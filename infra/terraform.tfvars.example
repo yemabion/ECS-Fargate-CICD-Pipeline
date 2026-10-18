@@ -1,6 +1,13 @@
 aws_region        = "us-east-1"
 github_repository = "YOUR_GH_USER/YOUR_REPO"
 
+# Newer GitHub repositories include numeric IDs in the OIDC token subject.
+# Find them with the GitHub CLI:
+#   gh api users/YOUR_GH_USER --jq .id
+#   gh api repos/YOUR_GH_USER/YOUR_REPO --jq .id
+github_owner_id = "YOUR_NUMERIC_OWNER_ID"
+github_repo_id  = "YOUR_NUMERIC_REPO_ID"
+
 # Set to false if your AWS account already has the GitHub OIDC provider
 # create_github_oidc_provider = true
 
